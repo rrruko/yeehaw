@@ -1,0 +1,7 @@
+[package]
+name = "yeehaw"
+version = "0.1.0"
+authors = ["ruko <rukokarasu@gmail.com>"]
+
+[dependencies]
+ggez = "0.4"
