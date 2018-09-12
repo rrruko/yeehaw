@@ -118,7 +118,7 @@ struct Assets {
 impl Assets {
     fn new(ctx: &mut Context) -> GameResult<Assets> {
         let player_image = graphics::Image::new(ctx, "/player.png")?;
-        let bullet_image = graphics::Image::new(ctx, "/sixtyfour.png")?;
+        let bullet_image = graphics::Image::new(ctx, "/bigger_bullet.png")?;
         let font = graphics::Font::new(ctx, "/Roboto-Regular.ttf", 18)?;
 
         Ok(Assets {
