@@ -140,7 +140,6 @@ struct InputState {
     jump: bool,
     shoot: bool,
     keys: HashSet<Input>,
-    shoot_pressed_last_frame: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -158,7 +157,6 @@ impl Default for InputState {
             yaxis: 0.0,
             jump: false,
             shoot: false,
-            shoot_pressed_last_frame: false,
             keys: HashSet::new(),
         }
     }
@@ -213,13 +211,11 @@ impl MainState {
         self.input.xaxis = (-1.0 * left) + (1.0 * right);
         self.input.jump = self.input.keys.contains(&Input::JUMP);
 
-        if !self.input.shoot_pressed_last_frame && self.input.keys.contains(&Input::SHOOT) {
+        if self.input.keys.contains(&Input::SHOOT) {
             self.input.shoot = true;
         } else {
             self.input.shoot = false;
         }
-
-        self.input.shoot_pressed_last_frame = self.input.keys.contains(&Input::SHOOT);
     }
 }
 
@@ -308,7 +304,7 @@ impl EventHandler for MainState {
             let p = &self.player;
             draw_actor(assets, ctx, p, self.screen_width, self.screen_height)?;
             draw_bullets(assets, ctx, &self.bullets, self.screen_width, self.screen_height)?;
-            graphics::line(ctx, &[Point2::new(0.0, 2.0*self.screen_height as f32/3.0), Point2::new(self.screen_width as f32, 2.0*self.screen_height as f32/3.0)], 1.0);
+            graphics::line(ctx, &[Point2::new(0.0, 2.0*self.screen_height as f32/3.0), Point2::new(self.screen_width as f32, 2.0*self.screen_height as f32/3.0)], 1.0)?;
         }
 
         let debug_data_pos = graphics::Point2::new(10.0, 10.0);
