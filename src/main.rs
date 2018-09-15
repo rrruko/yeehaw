@@ -318,6 +318,13 @@ impl MainState {
 
         self.input.tool = self.input.keys.contains(&Input::TOOL);
     }
+
+    fn register_keypress(&mut self, input: Input) {
+        if !self.input.keys.contains(&input) {
+            self.input.just_pressed.insert(input);
+        }
+        self.input.keys.insert(input);
+    }
 }
 
 /// Translates the world coordinate system, which
@@ -506,22 +513,19 @@ impl EventHandler for MainState {
     fn key_down_event(&mut self, ctx: &mut Context, keycode: Keycode, _keymod: Mod, _repeat: bool) {
         match keycode {
             Keycode::Left => {
-                self.input.keys.insert(Input::LEFT);
+                self.register_keypress(Input::LEFT);
             }
             Keycode::Right => {
-                self.input.keys.insert(Input::RIGHT);
+                self.register_keypress(Input::RIGHT);
             }
             Keycode::Up | Keycode::Space => {
-                self.input.keys.insert(Input::JUMP);
+                self.register_keypress(Input::JUMP);
             }
             Keycode::Z => {
-                self.input.keys.insert(Input::SHOOT);
+                self.register_keypress(Input::SHOOT);
             }
             Keycode::X => {
-                if !self.input.keys.contains(&Input::TOOL) {
-                    self.input.just_pressed.insert(Input::TOOL);
-                }
-                self.input.keys.insert(Input::TOOL);
+                self.register_keypress(Input::TOOL);
             }
             Keycode::Escape => ctx.quit().unwrap(),
             _ => (), // Do nothing
