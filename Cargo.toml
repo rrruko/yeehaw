@@ -4,4 +4,6 @@ version = "0.1.0"
 authors = ["ruko <rukokarasu@gmail.com>"]
 
 [dependencies]
+alga = "0.7.1"
 ggez = "0.4.4"
+rand = "0.5.5"

@@ -1,4 +1,5 @@
 extern crate ggez;
+extern crate rand;
 
 use ggez::audio;
 use ggez::conf;
@@ -11,11 +12,22 @@ use ggez::{Context, ContextBuilder, GameResult};
 
 use std::collections::HashSet;
 use std::env;
+use std::cmp::Ord;
 use std::path;
 
-///
-/// Actor
-///
+// Point2 already implements an equivalent trait but rust won't let me import
+// it
+trait Dist {
+    fn distance(&self, other: &Point2) -> f32;
+}
+
+impl Dist for Point2 {
+    fn distance(&self, other: &Point2) -> f32 {
+        let dx = self.x - other.x;
+        let dy = self.y - other.y;
+        (dx * dx + dy * dy).sqrt()
+    }
+}
 
 #[derive(Debug)]
 enum Facing {
@@ -25,10 +37,27 @@ enum Facing {
 
 #[derive(Debug)]
 struct Actor {
-    is_player: bool,
+    is_player: bool, // Currently useless since there's only one Actor
     pos: Point2,
     vel: Vector2,
-    jumping: bool
+    jumping: bool, // Set on jump, cleared on landing
+    shoot_cooldown: f32, // Little timer so the gun doesn't fire every frame
+    swing_data: Option<SwingData>, // If this is Some, the player is swinging
+}
+
+fn get_time(ctx: &Context) -> f64 {
+    timer::duration_to_f64(
+        timer::get_time_since_start(ctx)
+    )
+}
+
+#[derive(Debug)]
+struct SwingData {
+    theta0: f32,
+    theta: f32,
+    dist: f32,
+    start_time: f64,
+    target: Hook,
 }
 
 #[derive(Debug)]
@@ -38,13 +67,25 @@ struct Bullet {
     alive: bool,
 }
 
+#[derive(Copy, Clone, Debug)]
+struct Hook {
+    pos: Point2
+}
+
 #[derive(Debug)]
 struct Bullets {
     bullets: Vec<Bullet>,
 }
 
+// Why does this function floor and add 0.5?
+// ggez (or perhaps gfx) has a bug that causes sprites to be sampled
+// incorrectly when drawn at whole number floating point coords in the Nearest
+// filter mode. (The whole top row of pixels in the sprite disappears.)
+//
+// As far as I can tell, this happens *only* at whole number coordinates, so we
+// could just as well add 0.1 or 0.9.
 fn quantize(pos: Point2) -> Point2 {
-    Point2::new(pos.x.floor(), pos.y.floor())
+    Point2::new(pos.x.floor() + 0.5, pos.y.floor() + 0.5)
 }
 
 fn draw_actor(
@@ -62,7 +103,14 @@ fn draw_actor(
         offset: graphics::Point2::new(0.5, 0.5),
         ..Default::default()
     };
-    graphics::draw_ex(ctx, image, draw_params)
+    graphics::draw_ex(ctx, image, draw_params)?;
+
+    // Draw lasso
+    if let Some(ref sd) = actor.swing_data {
+        let target_pos = world_to_screen_coords(screen_width, screen_height, sd.target.pos);
+        graphics::line(ctx, &[pos, target_pos], 1.0)?;
+    }
+    Ok(())
 }
 
 fn draw_bullets(
@@ -75,7 +123,7 @@ fn draw_bullets(
     let image = &assets.bullet_image;
     for bullet in &bullets.bullets {
         if bullet.alive {
-            let pos = world_to_screen_coords(screen_width, screen_height, bullet.pos);
+            let mut pos = world_to_screen_coords(screen_width, screen_height, bullet.pos);
             let draw_params = graphics::DrawParam {
                 dest: quantize(pos),
                 rotation: 0.0,
@@ -88,12 +136,32 @@ fn draw_bullets(
     Ok(())
 }
 
+fn draw_hook(
+    assets: &mut Assets,
+    ctx: &mut Context,
+    hook: &Hook,
+    screen_width: u32,
+    screen_height: u32
+) -> GameResult<()> {
+    let image = &assets.hook_image;
+    let pos = world_to_screen_coords(screen_width, screen_height, hook.pos);
+    let draw_params = graphics::DrawParam {
+        dest: quantize(pos),
+        rotation: 0.0,
+        offset: graphics::Point2::new(0.5, 0.5),
+        ..Default::default()
+    };
+    graphics::draw_ex(ctx, image, draw_params)
+}
+
 fn create_player() -> Actor {
     Actor {
         is_player: true,
         pos: Point2::origin(),
         vel: na::zero(),
         jumping: false,
+        shoot_cooldown: 0.0,
+        swing_data: None,
     }
 }
 
@@ -109,21 +177,30 @@ fn create_bullets(n: u32) -> Bullets {
     Bullets { bullets }
 }
 
+fn create_hook(pos: Point2) -> Hook {
+    Hook {
+        pos
+    }
+}
+
 struct Assets {
     player_image: graphics::Image,
     bullet_image: graphics::Image,
+    hook_image: graphics::Image,
     font: graphics::Font,
 }
 
 impl Assets {
     fn new(ctx: &mut Context) -> GameResult<Assets> {
         let player_image = graphics::Image::new(ctx, "/player.png")?;
-        let bullet_image = graphics::Image::new(ctx, "/bigger_bullet.png")?;
+        let bullet_image = graphics::Image::new(ctx, "/big_bullet.png")?;
+        let hook_image = graphics::Image::new(ctx, "/big_bullet.png")?;
         let font = graphics::Font::new(ctx, "/Roboto-Regular.ttf", 18)?;
 
         Ok(Assets {
             player_image,
             bullet_image,
+            hook_image,
             font,
          })
     }
@@ -139,7 +216,9 @@ struct InputState {
     yaxis: f32,
     jump: bool,
     shoot: bool,
+    tool: bool,
     keys: HashSet<Input>,
+    just_pressed: HashSet<Input>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -148,6 +227,7 @@ enum Input {
     RIGHT,
     JUMP,
     SHOOT,
+    TOOL,
 }
 
 impl Default for InputState {
@@ -157,7 +237,9 @@ impl Default for InputState {
             yaxis: 0.0,
             jump: false,
             shoot: false,
+            tool: false,
             keys: HashSet::new(),
+            just_pressed: HashSet::new(),
         }
     }
 }
@@ -165,10 +247,13 @@ impl Default for InputState {
 struct MainState {
     player: Actor,
     bullets: Bullets,
+    hooks: Vec<Hook>,
     input: InputState,
     assets: Assets,
     screen_width: u32,
     screen_height: u32,
+    start_time: f64,
+    global_time: f64,
     debug_data: graphics::Text,
 }
 
@@ -182,15 +267,29 @@ impl MainState {
         let assets = Assets::new(ctx)?;
         let debug_data = graphics::Text::new(ctx, "debug", &assets.font)?;
 
-        let player = create_player();
-        let bullets = create_bullets(20);
+        let mut player = create_player();
+        let bullets = create_bullets(100);
+
+        let screen_width = ctx.conf.window_mode.width;
+        let screen_height = ctx.conf.window_mode.height;
+
+        let mut hooks = vec![];
+        for i in 0..3 {
+            let hook = create_hook(Point2::new(0.0, -50.0 + 40.0 * i as f32));
+            hooks.push(hook);
+        }
+
+        let now = get_time(ctx);
 
         let s = MainState {
             player,
             assets,
+            hooks,
             bullets,
-            screen_width: ctx.conf.window_mode.width,
-            screen_height: ctx.conf.window_mode.height,
+            screen_width,
+            screen_height,
+            start_time: now,
+            global_time: now,
             input: InputState::default(),
             debug_data
         };
@@ -216,6 +315,8 @@ impl MainState {
         } else {
             self.input.shoot = false;
         }
+
+        self.input.tool = self.input.keys.contains(&Input::TOOL);
     }
 }
 
@@ -231,16 +332,62 @@ fn world_to_screen_coords(screen_width: u32, screen_height: u32, point: Point2) 
     Point2::new(x, y)
 }
 
-fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, input: &InputState, dt: f32) {
+fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &Vec<Hook>, input: &InputState, dt: f32, t: f64) {
     actor.vel.x = input.xaxis * 200.0;
+
+    if let Some(ref mut sd) = actor.swing_data {
+        sd.theta0 += input.xaxis * dt;
+    }
 
     if input.jump && !actor.jumping {
         actor.jumping = true;
         actor.vel.y = 300.0;
     }
 
-    if input.shoot {
+    if input.just_pressed.contains(&Input::TOOL) {
+        // Later we should switch on the kind of tool equipped.
+        if let &Some(_) = &actor.swing_data {
+            // Detach if we're already hooked
+            actor.swing_data = None;
+            //actor.vel.y = 300.0;
+        } else {
+            actor.swing_data = try_hook(&actor, hooks, t);
+        }
+    }
+
+    if input.shoot && actor.shoot_cooldown == 0.0 {
+        actor.shoot_cooldown = 0.035;
         shoot_a_bullet(actor, bullets);
+    }
+}
+
+fn try_hook(actor: &Actor, hooks: &Vec<Hook>, t: f64) -> Option<SwingData> {
+    // Try to attach if we aren't hooked
+    // by finding the closest hook and checking if it's within 100 pixels
+    let (hook, nearest_dist) = hooks.iter()
+        .map(|hook| {
+            let d = hook.pos.distance(&actor.pos);
+            (hook, d)
+        })
+        .min_by(|x, y| {
+            PartialOrd::partial_cmp(&x.1, &y.1).unwrap()
+        })
+        .unwrap();
+    if nearest_dist < 100.0 {
+        let dx = actor.pos.x - hook.pos.x;
+        let dy = actor.pos.y - hook.pos.y;
+        let theta0 = dx.atan2(-dy);
+        let dist = (dx * dx + dy * dy).sqrt();
+
+        Some(SwingData {
+            theta0: theta0,
+            theta: theta0,
+            start_time: t,
+            target: hook.clone(),
+            dist: dist,
+        })
+    } else {
+        None
     }
 }
 
@@ -249,13 +396,39 @@ fn shoot_a_bullet(actor: &Actor, bullets: &mut Bullets) {
         if !bullet.alive {
             bullet.alive = true;
             bullet.pos = actor.pos;
-            bullet.vel = Vector2::new(800.0, 0.0);
+            bullet.vel = Vector2::new(600.0, 0.0);
             break;
         }
     }
 }
 
-fn player_update_position(actor: &mut Actor, dt: f32) {
+fn player_update_position(actor: &mut Actor, dt: f32, t: f64) {
+    let mut sd = actor.swing_data.take();
+    if let Some(ref mut swing_data) = sd {
+        player_update_swing(actor, swing_data, dt, t);
+    } else {
+        player_update_walk(actor, dt);
+    }
+    player_update_gun(actor, dt);
+    actor.swing_data = sd;
+}
+
+fn player_update_swing(actor: &mut Actor, swing_data: &mut SwingData, dt: f32, t: f64) {
+    let theta0 = swing_data.theta0;
+    let elapsed = t - swing_data.start_time;
+    let dist = swing_data.dist;
+    let k = 10.0 * 6.28 / dist as f64; // 2pi / period in seconds
+    let theta = theta0 * (k * elapsed).cos() as f32;
+    let target = swing_data.target;
+    swing_data.theta = theta;
+
+    actor.pos.x = target.pos.x + dist * theta.sin();
+    actor.pos.y = target.pos.y - dist * theta.cos();
+
+    actor.vel.y = 0.0;    
+}
+
+fn player_update_walk(actor: &mut Actor, dt: f32) {
     let dv = actor.vel * dt;
     actor.pos += dv;
 
@@ -270,11 +443,20 @@ fn player_update_position(actor: &mut Actor, dt: f32) {
     }
 }
 
+fn player_update_gun(actor: &mut Actor, dt: f32) {
+    if actor.shoot_cooldown > 0.0 {
+        actor.shoot_cooldown -= dt;
+    }
+    if actor.shoot_cooldown < 0.0 {
+        actor.shoot_cooldown = 0.0;
+    }
+}
+
 fn bullets_update_position(bullets: &mut Bullets, dt: f32) {
     for bullet in &mut bullets.bullets {
         if bullet.alive {
             bullet.pos += bullet.vel * dt;
-            if bullet.pos.x > 300.0 {
+            if bullet.pos.x > 400.0 {
                 bullet.alive = false;
             }
         }
@@ -287,12 +469,14 @@ impl EventHandler for MainState {
         while timer::check_update_time(ctx, DESIRED_FPS) {
             let seconds = 1.0 / (DESIRED_FPS as f32);
 
-            player_handle_input(&mut self.player, &mut self.bullets, &self.input, seconds);
-            player_update_position(&mut self.player, seconds);
+            player_handle_input(&mut self.player, &mut self.bullets, &self.hooks, &self.input, seconds, self.global_time);
+            player_update_position(&mut self.player, seconds, self.global_time);
             bullets_update_position(&mut self.bullets, seconds);
             self.update_ui(ctx);
             self.update_keys();
+            self.global_time = get_time(ctx);
         }
+        self.input.just_pressed.clear();
         Ok(())
     }
 
@@ -304,7 +488,9 @@ impl EventHandler for MainState {
             let p = &self.player;
             draw_actor(assets, ctx, p, self.screen_width, self.screen_height)?;
             draw_bullets(assets, ctx, &self.bullets, self.screen_width, self.screen_height)?;
-            graphics::line(ctx, &[Point2::new(0.0, 2.0*self.screen_height as f32/3.0), Point2::new(self.screen_width as f32, 2.0*self.screen_height as f32/3.0)], 1.0)?;
+            for hook in &self.hooks {
+                draw_hook(assets, ctx, &hook, self.screen_width, self.screen_height)?;
+            }
         }
 
         let debug_data_pos = graphics::Point2::new(10.0, 10.0);
@@ -331,6 +517,12 @@ impl EventHandler for MainState {
             Keycode::Z => {
                 self.input.keys.insert(Input::SHOOT);
             }
+            Keycode::X => {
+                if !self.input.keys.contains(&Input::TOOL) {
+                    self.input.just_pressed.insert(Input::TOOL);
+                }
+                self.input.keys.insert(Input::TOOL);
+            }
             Keycode::Escape => ctx.quit().unwrap(),
             _ => (), // Do nothing
         }
@@ -346,6 +538,9 @@ impl EventHandler for MainState {
             }
             Keycode::Z => {
                 self.input.keys.remove(&Input::SHOOT);
+            }
+            Keycode::X => {
+                self.input.keys.remove(&Input::TOOL);
             }
             Keycode::Up | Keycode::Space => {
                 self.input.keys.remove(&Input::JUMP);
