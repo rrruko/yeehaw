@@ -1,7 +1,6 @@
 extern crate ggez;
 extern crate rand;
 
-use ggez::audio;
 use ggez::conf;
 use ggez::event::{self, EventHandler, Keycode, Mod};
 use ggez::graphics;
@@ -12,7 +11,6 @@ use ggez::{Context, ContextBuilder, GameResult};
 
 use std::collections::HashSet;
 use std::env;
-use std::cmp::Ord;
 use std::path;
 
 // Point2 already implements an equivalent trait but rust won't let me import
@@ -123,7 +121,7 @@ fn draw_bullets(
     let image = &assets.bullet_image;
     for bullet in &bullets.bullets {
         if bullet.alive {
-            let mut pos = world_to_screen_coords(screen_width, screen_height, bullet.pos);
+            let pos = world_to_screen_coords(screen_width, screen_height, bullet.pos);
             let draw_params = graphics::DrawParam {
                 dest: quantize(pos),
                 rotation: 0.0,
@@ -139,7 +137,7 @@ fn draw_bullets(
 fn draw_hook(
     assets: &mut Assets,
     ctx: &mut Context,
-    hook: &Hook,
+    hook: Hook,
     screen_width: u32,
     screen_height: u32
 ) -> GameResult<()> {
@@ -167,7 +165,7 @@ fn create_player() -> Actor {
 
 fn create_bullets(n: u32) -> Bullets {
     let mut bullets = Vec::new();
-    for i in 0..n {
+    for _ in 0..n {
         bullets.push(Bullet {
             pos: Point2::new(0.0, 0.0),
             vel: Vector2::new(0.0, 0.0),
@@ -205,7 +203,7 @@ impl Assets {
          })
     }
 
-    fn actor_image(&mut self, actor: &Actor) -> &mut graphics::Image {
+    fn actor_image(&mut self, _: &Actor) -> &mut graphics::Image {
         &mut self.player_image
     }
 }
@@ -252,7 +250,6 @@ struct MainState {
     assets: Assets,
     screen_width: u32,
     screen_height: u32,
-    start_time: f64,
     global_time: f64,
     debug_data: graphics::Text,
 }
@@ -267,7 +264,7 @@ impl MainState {
         let assets = Assets::new(ctx)?;
         let debug_data = graphics::Text::new(ctx, "debug", &assets.font)?;
 
-        let mut player = create_player();
+        let player = create_player();
         let bullets = create_bullets(100);
 
         let screen_width = ctx.conf.window_mode.width;
@@ -288,7 +285,6 @@ impl MainState {
             bullets,
             screen_width,
             screen_height,
-            start_time: now,
             global_time: now,
             input: InputState::default(),
             debug_data
@@ -303,19 +299,14 @@ impl MainState {
 
         self.debug_data = debug_text;
     }
-    
+
     fn update_keys(&mut self) {
         let left = self.input.keys.contains(&Input::LEFT) as i32 as f32;
         let right = self.input.keys.contains(&Input::RIGHT) as i32 as f32;
         self.input.xaxis = (-1.0 * left) + (1.0 * right);
+
         self.input.jump = self.input.keys.contains(&Input::JUMP);
-
-        if self.input.keys.contains(&Input::SHOOT) {
-            self.input.shoot = true;
-        } else {
-            self.input.shoot = false;
-        }
-
+        self.input.shoot = self.input.keys.contains(&Input::SHOOT);
         self.input.tool = self.input.keys.contains(&Input::TOOL);
     }
 
@@ -339,7 +330,7 @@ fn world_to_screen_coords(screen_width: u32, screen_height: u32, point: Point2) 
     Point2::new(x, y)
 }
 
-fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &Vec<Hook>, input: &InputState, dt: f32, t: f64) {
+fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &[Hook], input: &InputState, dt: f32, t: f64) {
     actor.vel.x = input.xaxis * 200.0;
 
     if let Some(ref mut sd) = actor.swing_data {
@@ -353,7 +344,7 @@ fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &Vec<Hoo
 
     if input.just_pressed.contains(&Input::TOOL) {
         // Later we should switch on the kind of tool equipped.
-        if let &Some(_) = &actor.swing_data {
+        if actor.swing_data.is_some() {
             // Detach if we're already hooked
             actor.swing_data = None;
             //actor.vel.y = 300.0;
@@ -368,7 +359,7 @@ fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &Vec<Hoo
     }
 }
 
-fn try_hook(actor: &Actor, hooks: &Vec<Hook>, t: f64) -> Option<SwingData> {
+fn try_hook(actor: &Actor, hooks: &[Hook], t: f64) -> Option<SwingData> {
     // Try to attach if we aren't hooked
     // by finding the closest hook and checking if it's within 100 pixels
     let (hook, nearest_dist) = hooks.iter()
@@ -387,11 +378,11 @@ fn try_hook(actor: &Actor, hooks: &Vec<Hook>, t: f64) -> Option<SwingData> {
         let dist = (dx * dx + dy * dy).sqrt();
 
         Some(SwingData {
-            theta0: theta0,
+            theta0,
             theta: theta0,
             start_time: t,
-            target: hook.clone(),
-            dist: dist,
+            target: *hook,
+            dist,
         })
     } else {
         None
@@ -412,7 +403,7 @@ fn shoot_a_bullet(actor: &Actor, bullets: &mut Bullets) {
 fn player_update_position(actor: &mut Actor, dt: f32, t: f64) {
     let mut sd = actor.swing_data.take();
     if let Some(ref mut swing_data) = sd {
-        player_update_swing(actor, swing_data, dt, t);
+        player_update_swing(actor, swing_data, t);
     } else {
         player_update_walk(actor, dt);
     }
@@ -420,11 +411,11 @@ fn player_update_position(actor: &mut Actor, dt: f32, t: f64) {
     actor.swing_data = sd;
 }
 
-fn player_update_swing(actor: &mut Actor, swing_data: &mut SwingData, dt: f32, t: f64) {
+fn player_update_swing(actor: &mut Actor, swing_data: &mut SwingData, t: f64) {
     let theta0 = swing_data.theta0;
     let elapsed = t - swing_data.start_time;
     let dist = swing_data.dist;
-    let k = 10.0 * 6.28 / dist as f64; // 2pi / period in seconds
+    let k = 10.0 * 6.28 / f64::from(dist); // 2pi / period in seconds
     let theta = theta0 * (k * elapsed).cos() as f32;
     let target = swing_data.target;
     swing_data.theta = theta;
@@ -432,7 +423,7 @@ fn player_update_swing(actor: &mut Actor, swing_data: &mut SwingData, dt: f32, t
     actor.pos.x = target.pos.x + dist * theta.sin();
     actor.pos.y = target.pos.y - dist * theta.cos();
 
-    actor.vel.y = 0.0;    
+    actor.vel.y = 0.0;
 }
 
 fn player_update_walk(actor: &mut Actor, dt: f32) {
@@ -496,7 +487,7 @@ impl EventHandler for MainState {
             draw_actor(assets, ctx, p, self.screen_width, self.screen_height)?;
             draw_bullets(assets, ctx, &self.bullets, self.screen_width, self.screen_height)?;
             for hook in &self.hooks {
-                draw_hook(assets, ctx, &hook, self.screen_width, self.screen_height)?;
+                draw_hook(assets, ctx, *hook, self.screen_width, self.screen_height)?;
             }
         }
 
