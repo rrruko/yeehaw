@@ -33,11 +33,21 @@ enum Facing {
     Right,
 }
 
+impl Facing {
+    fn to_f32(&self) -> f32 {
+        match self {
+            Facing::Left => -1.0,
+            Facing::Right => 1.0
+        }
+    }
+}
+
 #[derive(Debug)]
 struct Actor {
     is_player: bool, // Currently useless since there's only one Actor
     pos: Point2,
     vel: Vector2,
+    facing: Facing,
     jumping: bool, // Set on jump, cleared on landing
     shoot_cooldown: f32, // Little timer so the gun doesn't fire every frame
     swing_data: Option<SwingData>, // If this is Some, the player is swinging
@@ -157,6 +167,7 @@ fn create_player() -> Actor {
         is_player: true,
         pos: Point2::origin(),
         vel: na::zero(),
+        facing: Facing::Right,
         jumping: false,
         shoot_cooldown: 0.0,
         swing_data: None,
@@ -272,7 +283,7 @@ impl MainState {
 
         let mut hooks = vec![];
         for i in 0..3 {
-            let hook = create_hook(Point2::new(0.0, -50.0 + 40.0 * i as f32));
+            let hook = create_hook(Point2::new(-150.0 + 150.0 * i as f32, 0.0));
             hooks.push(hook);
         }
 
@@ -300,7 +311,18 @@ impl MainState {
         self.debug_data = debug_text;
     }
 
-    fn update_keys(&mut self) {
+    /// The input state contains useful (but strictly redundant) flags that
+    ///   area easier to use than just checking what inputs are pressed. This
+    ///   function updates them.
+    fn update_key_flags(&mut self) {
+        // true  as i32 as f32 = 1.0
+        // false as i32 as f32 = 0.0
+        // This way, simultaneously pressing both left and right does nothing.
+        //   It might be better to give precedence to whichever input was
+        //   pressed latest, e.g. if you were holding right, then began to hold
+        //   left while still holding right, the character would turn around.
+        //   Instead we just require the player to release right if they want
+        //   to turn around.
         let left = self.input.keys.contains(&Input::LEFT) as i32 as f32;
         let right = self.input.keys.contains(&Input::RIGHT) as i32 as f32;
         self.input.xaxis = (-1.0 * left) + (1.0 * right);
@@ -333,6 +355,12 @@ fn world_to_screen_coords(screen_width: u32, screen_height: u32, point: Point2) 
 fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &[Hook], input: &InputState, dt: f32, t: f64) {
     actor.vel.x = input.xaxis * 200.0;
 
+    if input.xaxis < 0.0 && !input.shoot {
+        actor.facing = Facing::Left;
+    } else if input.xaxis > 0.0 && !input.shoot {
+        actor.facing = Facing::Right;
+    }
+
     if let Some(ref mut sd) = actor.swing_data {
         sd.theta0 += input.xaxis * dt;
     }
@@ -340,16 +368,14 @@ fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &[Hook],
     if input.jump && !actor.jumping {
         actor.jumping = true;
         actor.vel.y = 300.0;
+        actor.swing_data = None;
     }
 
     if input.just_pressed.contains(&Input::TOOL) {
         // Later we should switch on the kind of tool equipped.
+        actor.swing_data = try_hook(&actor, hooks, t);
         if actor.swing_data.is_some() {
-            // Detach if we're already hooked
-            actor.swing_data = None;
-            //actor.vel.y = 300.0;
-        } else {
-            actor.swing_data = try_hook(&actor, hooks, t);
+            actor.jumping = false;
         }
     }
 
@@ -394,7 +420,7 @@ fn shoot_a_bullet(actor: &Actor, bullets: &mut Bullets) {
         if !bullet.alive {
             bullet.alive = true;
             bullet.pos = actor.pos;
-            bullet.vel = Vector2::new(600.0, 0.0);
+            bullet.vel = Vector2::new(600.0 * actor.facing.to_f32(), 0.0);
             break;
         }
     }
@@ -454,7 +480,7 @@ fn bullets_update_position(bullets: &mut Bullets, dt: f32) {
     for bullet in &mut bullets.bullets {
         if bullet.alive {
             bullet.pos += bullet.vel * dt;
-            if bullet.pos.x > 400.0 {
+            if bullet.pos.x > 400.0 || bullet.pos.x < -400.0 {
                 bullet.alive = false;
             }
         }
@@ -471,7 +497,7 @@ impl EventHandler for MainState {
             player_update_position(&mut self.player, seconds, self.global_time);
             bullets_update_position(&mut self.bullets, seconds);
             self.update_ui(ctx);
-            self.update_keys();
+            self.update_key_flags();
             self.global_time = get_time(ctx);
         }
         self.input.just_pressed.clear();
