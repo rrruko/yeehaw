@@ -53,6 +53,14 @@ struct Actor {
     swing_data: Option<SwingData>, // If this is Some, the player is swinging
 }
 
+struct Boss {
+    pos: Point2,
+    vel: Vector2,
+    hp: f32,
+    facing: Facing,
+    jumping: bool,
+}
+
 fn get_time(ctx: &Context) -> f64 {
     timer::duration_to_f64(
         timer::get_time_since_start(ctx)
@@ -121,6 +129,25 @@ fn draw_actor(
     Ok(())
 }
 
+fn draw_boss(
+    assets: &mut Assets,
+    ctx: &mut Context,
+    boss: &Boss,
+    screen_width: u32,
+    screen_height: u32,
+) -> GameResult<()> {
+    let pos = world_to_screen_coords(screen_width, screen_height, boss.pos);
+    let image = &assets.player_image;
+    let draw_params = graphics::DrawParam {
+        dest: quantize(pos),
+        rotation: 0.0,
+        offset: graphics::Point2::new(0.5, 0.5),
+        ..Default::default()
+    };
+    graphics::draw_ex(ctx, image, draw_params)?;
+
+    Ok(())
+}
 fn draw_bullets(
     assets: &mut Assets,
     ctx: &mut Context,
@@ -184,6 +211,16 @@ fn create_bullets(n: u32) -> Bullets {
         });
     }
     Bullets { bullets }
+}
+
+fn create_boss() -> Boss {
+    Boss {
+        pos: Point2::origin(),
+        vel: na::zero(),
+        hp: 50.0,
+        facing: Facing::Left,
+        jumping: false
+    }
 }
 
 fn create_hook(pos: Point2) -> Hook {
@@ -256,6 +293,7 @@ impl Default for InputState {
 struct MainState {
     player: Actor,
     bullets: Bullets,
+    boss: Boss,
     hooks: Vec<Hook>,
     input: InputState,
     assets: Assets,
@@ -289,9 +327,12 @@ impl MainState {
 
         let now = get_time(ctx);
 
+        let boss = create_boss();
+
         let s = MainState {
             player,
             assets,
+            boss,
             hooks,
             bullets,
             screen_width,
@@ -476,6 +517,33 @@ fn player_update_gun(actor: &mut Actor, dt: f32) {
     }
 }
 
+fn boss_update(boss: &mut Boss, player: &mut Actor, dt: f32) {
+    let dv = boss.vel * dt;
+    boss.pos += dv;
+
+    let dist = player.pos.x - boss.pos.x;
+
+    if dist.abs() > 5.0 { // Chase player
+        let direction = dist.signum();
+        if direction > 0.0 {
+            boss.facing = Facing::Right;
+        } else {
+            boss.facing = Facing::Left;
+        }
+        boss.pos.x += direction * 100.0 * dt;
+    }
+
+    if boss.pos.y < -150.0 {
+        boss.pos.y = -150.0;
+        if boss.vel.y < 0.0 {
+            boss.vel.y = 0.0;
+            boss.jumping = false;
+        }
+    } else {
+        boss.vel.y -= dt * 500.0;
+    }
+}
+
 fn bullets_update_position(bullets: &mut Bullets, dt: f32) {
     for bullet in &mut bullets.bullets {
         if bullet.alive {
@@ -496,6 +564,7 @@ impl EventHandler for MainState {
             player_handle_input(&mut self.player, &mut self.bullets, &self.hooks, &self.input, seconds, self.global_time);
             player_update_position(&mut self.player, seconds, self.global_time);
             bullets_update_position(&mut self.bullets, seconds);
+            boss_update(&mut self.boss, &mut self.player, seconds);
             self.update_ui(ctx);
             self.update_key_flags();
             self.global_time = get_time(ctx);
@@ -511,6 +580,7 @@ impl EventHandler for MainState {
             let assets = &mut self.assets;
             let p = &self.player;
             draw_actor(assets, ctx, p, self.screen_width, self.screen_height)?;
+            draw_boss(assets, ctx, &self.boss, self.screen_width, self.screen_height)?;
             draw_bullets(assets, ctx, &self.bullets, self.screen_width, self.screen_height)?;
             for hook in &self.hooks {
                 draw_hook(assets, ctx, *hook, self.screen_width, self.screen_height)?;
