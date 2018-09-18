@@ -1,5 +1,8 @@
 extern crate ggez;
 extern crate rand;
+extern crate specs;
+#[macro_use]
+extern crate specs_derive;
 
 use ggez::conf;
 use ggez::event::{self, EventHandler, Keycode, Mod};
@@ -9,6 +12,7 @@ use ggez::nalgebra as na;
 use ggez::timer;
 use ggez::{Context, ContextBuilder, GameResult};
 
+use specs::prelude::*;
 use std::collections::HashSet;
 use std::env;
 use std::path;
@@ -27,14 +31,259 @@ impl Dist for Point2 {
     }
 }
 
-#[derive(Debug)]
+#[derive(Component, Debug)]
+struct Vel(Vector2);
+
+#[derive(Component, Clone, Copy, Debug)]
+struct Pos(Point2);
+
+#[derive(Component, Debug)]
+struct IsPlayer;
+
+#[derive(Component, Debug)]
+struct DeltaTime(f32);
+
+#[derive(Component, Debug)]
+struct GlobalTime(f64);
+
+#[derive(Component, Debug)]
+struct HasGravity;
+
+#[derive(Component, Debug)]
+struct IsJumping(bool);
+
+impl Default for DeltaTime {
+    fn default() -> Self {
+        DeltaTime(0.0)
+    }
+}
+
+impl Default for GlobalTime {
+    fn default() -> Self {
+        GlobalTime(0.0)
+    }
+}
+
+struct RigidBodyPhysics;
+
+impl<'a> System<'a> for RigidBodyPhysics {
+    type SystemData = (Read<'a, DeltaTime>,
+                       Entities<'a>,
+                       WriteStorage<'a, Pos>,
+                       WriteStorage<'a, Vel>,
+                       ReadStorage<'a, HasGravity>);
+
+    fn run(&mut self, (dt, entities, mut pos, mut vel, has_gravity): Self::SystemData) {
+        let dt = dt.0;
+        for (ent, pos, vel) in (&*entities, &mut pos, &mut vel).join() {
+            pos.0 += vel.0 * dt; // update pos
+
+            if has_gravity.get(ent).is_some() {
+                vel.0.y -= 500.0 * dt; // gravity
+            }
+        }
+    }
+}
+
+struct PlayerControl;
+
+impl<'a> System<'a> for PlayerControl {
+    type SystemData = (Read<'a, InputState>,
+                       Read<'a, DeltaTime>,
+                       WriteStorage<'a, Pos>,
+                       WriteStorage<'a, Vel>,
+                       WriteStorage<'a, Facing>,
+                       WriteStorage<'a, ShootCooldown>,
+                       WriteStorage<'a, IsJumping>,
+                       ReadStorage<'a, IsPlayer>);
+    fn run(&mut self, (input, dt, mut pos, mut vel, mut facing, mut cooldown, mut is_jumping, is_player): Self::SystemData) {
+        let dt = dt.0;
+        for (pos, vel, facing, cooldown, is_jumping, _) in (&mut pos, &mut vel, &mut facing, &mut cooldown, &mut is_jumping, &is_player).join() {
+            pos.0.x += input.xaxis * dt * 100.0;
+            
+            if pos.0.y < -150.0 {
+                pos.0.y = -150.0;
+                vel.0.y = 0.0;
+                is_jumping.0 = false;
+            }
+
+            if input.keys.contains(&Input::JUMP) && !is_jumping.0 {
+                vel.0.y = 300.0;
+                is_jumping.0 = true;
+            }
+
+            if cooldown.0 > 0.0 {
+                cooldown.0 -= dt;
+            }
+            if cooldown.0 < 0.0 {
+                cooldown.0 = 0.0;
+            }
+
+            if input.xaxis < 0.0 {
+                std::mem::replace(facing, Facing::Left);
+            } else if input.xaxis > 0.0 {
+                std::mem::replace(facing, Facing::Right);
+            }
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy, Debug)]
+enum BulletStatus {
+    Alive,
+    Dead,
+}
+
+#[derive(Component, Debug)]
+struct ShootCooldown(f32);
+
+struct ShootBullets;
+
+impl<'a> System<'a> for ShootBullets {
+    type SystemData = (Read<'a, InputState>,
+                       WriteStorage<'a, Pos>,
+                       WriteStorage<'a, Vel>,
+                       ReadStorage<'a, IsPlayer>,
+                       ReadStorage<'a, Facing>,
+                       WriteStorage<'a, ShootCooldown>,
+                       WriteStorage<'a, BulletStatus>,
+                       Read<'a, DeltaTime>);
+    fn run(&mut self, (input, mut pos, mut vel, is_player, facing, mut cooldown, mut bullet, dt): Self::SystemData) {
+        let dt = dt.0;
+        let shoot = input.shoot;
+
+        let mut player_pos = None;
+        let mut player_facing = None;
+        let mut player_cooldown = std::f32::INFINITY;
+        {
+            for (pos, facing, mut cooldown, _) in (&pos, &facing, &mut cooldown, &is_player).join() {
+                player_pos = Some(*pos);
+                player_facing = Some(*facing);
+                if cooldown.0 > 0.0 {
+                    cooldown.0 -= dt;
+                }
+                if cooldown.0 < 0.0 {
+                    cooldown.0 = 0.0;
+                }
+                player_cooldown = cooldown.0;
+                if cooldown.0 == 0.0 && input.shoot {
+                    cooldown.0 = 0.035;
+                }
+            }
+        }
+
+        if let (Some(player_pos), Some(facing)) = (player_pos, player_facing) {
+            if input.shoot && player_cooldown == 0.0 {
+                for (mut pos, mut vel, mut bullet) in (&mut pos, &mut vel, &mut bullet).join() {
+                    if let BulletStatus::Dead = bullet {
+                        std::mem::replace(bullet, BulletStatus::Alive);
+                        pos.0 = player_pos.0;
+                        vel.0 = Vector2::new(600.0 * facing.to_f32(), 0.0);
+                        break;
+                    }
+                }
+            }
+        }
+
+        for (mut pos, mut bullet) in (&mut pos, &mut bullet).join() {
+            if pos.0.x.abs() > 400.0 || pos.0.y.abs() > 400.0 {
+                std::mem::replace(bullet, BulletStatus::Dead);
+            }
+        }
+    }
+}
+
+#[derive(Component, Debug)]
+struct IsHook;
+
+#[derive(Component, Debug)]
+struct IsSwingTarget;
+
+#[derive(Component, Clone, Copy, Debug)]
+struct SwingData_ {
+    theta0: f32,
+    theta: f32,
+    dist: f32,
+    start_time: f64,
+}
+
+struct DoHook;
+
+impl<'a> System<'a> for DoHook {
+    type SystemData = (Read<'a, InputState>,
+                       Entities<'a>,
+                       WriteStorage<'a, Pos>,
+                       ReadStorage<'a, IsPlayer>,
+                       WriteStorage<'a, SwingData_>,
+                       ReadStorage<'a, IsHook>,
+                       WriteStorage<'a, IsSwingTarget>,
+                       Read<'a, DeltaTime>,
+                       Read<'a, GlobalTime>);
+    fn run(&mut self, (input, entities, mut pos, is_player, mut swing_data, is_hook, mut is_target, dt, t): Self::SystemData) {
+        if input.just_pressed.contains(&Input::TOOL) {
+            for (mut player_entity, _) in (&*entities, &is_player).join() {
+                match swing_data.get(player_entity).cloned() {
+                    Some(sd) => {
+                        swing_data.remove(player_entity);
+                    }
+                    None => {
+                        let hooks = (&*entities, &is_hook).join().map(|(e, h)| e).collect();
+                        self.try_hook(&mut pos, &mut is_target, &mut player_entity, &mut swing_data, hooks, t.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl<'a> DoHook {
+    fn try_hook(&mut self, 
+                pos: &mut WriteStorage<'a, Pos>,
+                is_target: &mut WriteStorage<'a, IsSwingTarget>,
+                player: &mut Entity,
+                swing_data: &mut WriteStorage<'a, SwingData_>,
+                hooks: Vec<Entity>,
+                t: f64
+    ) {
+        if let Some(player_pos) = pos.get(*player) {
+            let (ent, hook_pos, nearest_dist) = hooks.iter()
+                .map(|entity| {
+                    let hook_pos = pos.get(*entity).unwrap();
+                    let d = hook_pos.0.distance(&player_pos.0);
+                    (entity, hook_pos, d)
+                })
+                .min_by(|x, y| {
+                    PartialOrd::partial_cmp(&x.2, &y.2).unwrap()
+                })
+                .unwrap();
+            
+            is_target.insert(*ent, IsSwingTarget);
+            if nearest_dist < 100.0 {
+                let dx = player_pos.0.x - hook_pos.0.x;
+                let dy = player_pos.0.y - hook_pos.0.y;
+                let theta0 = dx.atan2(-dy);
+                let dist = (dx * dx + dy * dy).sqrt();
+
+                swing_data.insert(*player, SwingData_ {
+                    theta0,
+                    theta: theta0,
+                    start_time: t,
+                    dist,
+                });
+                println!("Inserted swing data at dist {}", dist);
+            } 
+        }
+    }
+}
+
+#[derive(Component, Clone, Copy, Debug)]
 enum Facing {
     Left,
     Right,
 }
 
 impl Facing {
-    fn to_f32(&self) -> f32 {
+    fn to_f32(self) -> f32 {
         match self {
             Facing::Left => -1.0,
             Facing::Right => 1.0
@@ -53,12 +302,19 @@ struct Actor {
     swing_data: Option<SwingData>, // If this is Some, the player is swinging
 }
 
+enum BossPhase {
+    Attack,
+    Evade,
+}
+
 struct Boss {
     pos: Point2,
     vel: Vector2,
     hp: f32,
     facing: Facing,
     jumping: bool,
+    phase: BossPhase,
+    phase_timer: f32,
 }
 
 fn get_time(ctx: &Context) -> f64 {
@@ -129,6 +385,42 @@ fn draw_actor(
     Ok(())
 }
 
+fn draw_debug_sprite(
+    assets: &mut Assets,
+    ctx: &mut Context,
+    pos: Pos,
+    screen_width: u32,
+    screen_height: u32,
+) -> GameResult<()> {
+    let pos = world_to_screen_coords(screen_width, screen_height, pos.0);
+    let image = &assets.player_image;
+    let draw_params = graphics::DrawParam {
+        dest: quantize(pos),
+        offset: graphics::Point2::new(0.5, 0.5),
+        ..Default::default()
+    };
+    graphics::draw_ex(ctx, image, draw_params)?;
+    Ok(())
+}
+
+fn draw_bullet_sprite(
+    assets: &mut Assets,
+    ctx: &mut Context,
+    pos: Pos,
+    screen_width: u32,
+    screen_height: u32,
+) -> GameResult<()> {
+    let pos = world_to_screen_coords(screen_width, screen_height, pos.0);
+    let image = &assets.bullet_image;
+    let draw_params = graphics::DrawParam {
+        dest: quantize(pos),
+        offset: graphics::Point2::new(0.5, 0.5),
+        ..Default::default()
+    };
+    graphics::draw_ex(ctx, image, draw_params)?;
+    Ok(())
+}
+
 fn draw_boss(
     assets: &mut Assets,
     ctx: &mut Context,
@@ -148,6 +440,7 @@ fn draw_boss(
 
     Ok(())
 }
+
 fn draw_bullets(
     assets: &mut Assets,
     ctx: &mut Context,
@@ -219,7 +512,9 @@ fn create_boss() -> Boss {
         vel: na::zero(),
         hp: 50.0,
         facing: Facing::Left,
-        jumping: false
+        jumping: false,
+        phase: BossPhase::Attack,
+        phase_timer: 0.0,
     }
 }
 
@@ -267,6 +562,15 @@ struct InputState {
     just_pressed: HashSet<Input>,
 }
 
+impl InputState {
+    fn register_keypress(&mut self, input: Input) {
+        if !self.keys.contains(&input) {
+            self.just_pressed.insert(input);
+        }
+        self.keys.insert(input);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Input {
     LEFT,
@@ -290,21 +594,22 @@ impl Default for InputState {
     }
 }
 
-struct MainState {
+struct MainState<'a, 'b> {
     player: Actor,
     bullets: Bullets,
     boss: Boss,
     hooks: Vec<Hook>,
-    input: InputState,
     assets: Assets,
     screen_width: u32,
     screen_height: u32,
     global_time: f64,
     debug_data: graphics::Text,
+    world: World,
+    dispatcher: Dispatcher<'a, 'b>
 }
 
-impl MainState {
-    fn new(ctx: &mut Context) -> GameResult<MainState> {
+impl<'a, 'b> MainState<'a, 'b> {
+    fn new(ctx: &mut Context) -> GameResult<MainState<'a, 'b>> {
         ctx.print_resource_stats();
         graphics::set_background_color(ctx, (0, 0, 0, 255).into());
 
@@ -329,6 +634,54 @@ impl MainState {
 
         let boss = create_boss();
 
+        let mut world = World::new();
+        world.register::<Pos>();
+        world.register::<Vel>();
+        world.register::<IsPlayer>();
+        world.register::<BulletStatus>();
+        world.register::<Facing>();
+        world.register::<HasGravity>();
+        world.register::<ShootCooldown>();
+        world.register::<IsJumping>();
+        world.register::<IsHook>();
+
+        // The player
+        world.create_entity()
+            .with(Vel(na::zero()))
+            .with(Pos(Point2::new(0.0, 0.0)))
+            .with(Facing::Right)
+            .with(IsPlayer)
+            .with(HasGravity)
+            .with(IsJumping(false))
+            .with(ShootCooldown(0.035))
+            .build();
+
+        for _ in 0..100 {
+            world.create_entity()
+                .with(Vel(na::zero()))
+                .with(Pos(Point2::new(0.0, 0.0)))
+                .with(BulletStatus::Dead)
+                .build();
+        }
+
+        for i in 0..3 {
+            world.create_entity()
+                .with(Pos(Point2::new(-150.0 + 150.0 * i as f32, 0.0)))
+                .with(IsHook)
+                .build();
+        }
+
+        world.add_resource(DeltaTime(0.0));
+        world.add_resource(InputState::default());
+
+        let mut dispatcher = DispatcherBuilder::new()
+            .with(RigidBodyPhysics, "rigid-body-physics", &[])
+            .with(PlayerControl, "player-control", &[])
+            .with(ShootBullets, "shoot-bullets", &[])
+            .with(DoHook, "do-hook", &[])
+            .build();
+        dispatcher.setup(&mut world.res);
+
         let s = MainState {
             player,
             assets,
@@ -338,15 +691,16 @@ impl MainState {
             screen_width,
             screen_height,
             global_time: now,
-            input: InputState::default(),
-            debug_data
+            debug_data,
+            world,
+            dispatcher
         };
 
         Ok(s)
     }
 
     fn update_ui(&mut self, ctx: &mut Context) {
-        let debug_str = format!("Debug: {}", self.player.pos.y);
+        let debug_str = format!("Debug: {}", timer::get_fps(ctx) as i32);
         let debug_text = graphics::Text::new(ctx, &debug_str, &self.assets.font).unwrap();
 
         self.debug_data = debug_text;
@@ -364,20 +718,29 @@ impl MainState {
         //   left while still holding right, the character would turn around.
         //   Instead we just require the player to release right if they want
         //   to turn around.
-        let left = self.input.keys.contains(&Input::LEFT) as i32 as f32;
-        let right = self.input.keys.contains(&Input::RIGHT) as i32 as f32;
-        self.input.xaxis = (-1.0 * left) + (1.0 * right);
+        
+        let mut input_state = self.world.write_resource::<InputState>();
 
-        self.input.jump = self.input.keys.contains(&Input::JUMP);
-        self.input.shoot = self.input.keys.contains(&Input::SHOOT);
-        self.input.tool = self.input.keys.contains(&Input::TOOL);
+        let left = input_state.keys.contains(&Input::LEFT) as i32 as f32;
+        let right = input_state.keys.contains(&Input::RIGHT) as i32 as f32;
+        input_state.xaxis = (-1.0 * left) + (1.0 * right);
+
+        input_state.jump = input_state.keys.contains(&Input::JUMP);
+        input_state.shoot = input_state.keys.contains(&Input::SHOOT);
+        input_state.tool = input_state.keys.contains(&Input::TOOL);
     }
 
     fn register_keypress(&mut self, input: Input) {
-        if !self.input.keys.contains(&input) {
-            self.input.just_pressed.insert(input);
+        let mut input_state = self.world.write_resource::<InputState>();
+        if !input_state.keys.contains(&input) {
+            input_state.just_pressed.insert(input);
         }
-        self.input.keys.insert(input);
+        input_state.keys.insert(input);
+    }
+
+    fn unregister_keypress(&mut self, input: Input) {
+        let mut input_state = self.world.write_resource::<InputState>();
+        input_state.keys.remove(&input);
     }
 }
 
@@ -393,6 +756,7 @@ fn world_to_screen_coords(screen_width: u32, screen_height: u32, point: Point2) 
     Point2::new(x, y)
 }
 
+/*
 fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &[Hook], input: &InputState, dt: f32, t: f64) {
     actor.vel.x = input.xaxis * 200.0;
 
@@ -424,7 +788,7 @@ fn player_handle_input(actor: &mut Actor, bullets: &mut Bullets, hooks: &[Hook],
         actor.shoot_cooldown = 0.035;
         shoot_a_bullet(actor, bullets);
     }
-}
+}*/
 
 fn try_hook(actor: &Actor, hooks: &[Hook], t: f64) -> Option<SwingData> {
     // Try to attach if we aren't hooked
@@ -456,25 +820,14 @@ fn try_hook(actor: &Actor, hooks: &[Hook], t: f64) -> Option<SwingData> {
     }
 }
 
-fn shoot_a_bullet(actor: &Actor, bullets: &mut Bullets) {
-    for bullet in &mut bullets.bullets {
-        if !bullet.alive {
-            bullet.alive = true;
-            bullet.pos = actor.pos;
-            bullet.vel = Vector2::new(600.0 * actor.facing.to_f32(), 0.0);
-            break;
-        }
-    }
-}
-
 fn player_update_position(actor: &mut Actor, dt: f32, t: f64) {
     let mut sd = actor.swing_data.take();
     if let Some(ref mut swing_data) = sd {
         player_update_swing(actor, swing_data, t);
     } else {
-        player_update_walk(actor, dt);
+        //player_update_walk(actor, dt);
     }
-    player_update_gun(actor, dt);
+    //player_update_gun(actor, dt);
     actor.swing_data = sd;
 }
 
@@ -493,31 +846,7 @@ fn player_update_swing(actor: &mut Actor, swing_data: &mut SwingData, t: f64) {
     actor.vel.y = 0.0;
 }
 
-fn player_update_walk(actor: &mut Actor, dt: f32) {
-    let dv = actor.vel * dt;
-    actor.pos += dv;
-
-    if actor.pos.y < -150.0 {
-        actor.pos.y = -150.0;
-        if actor.vel.y < 0.0 {
-            actor.vel.y = 0.0;
-            actor.jumping = false;
-        }
-    } else {
-        actor.vel.y -= dt * 500.0;
-    }
-}
-
-fn player_update_gun(actor: &mut Actor, dt: f32) {
-    if actor.shoot_cooldown > 0.0 {
-        actor.shoot_cooldown -= dt;
-    }
-    if actor.shoot_cooldown < 0.0 {
-        actor.shoot_cooldown = 0.0;
-    }
-}
-
-fn boss_update(boss: &mut Boss, player: &mut Actor, dt: f32) {
+fn boss_update(boss: &mut Boss, player: &mut Actor, bullets: &mut Bullets, dt: f32) {
     let dv = boss.vel * dt;
     boss.pos += dv;
 
@@ -542,6 +871,65 @@ fn boss_update(boss: &mut Boss, player: &mut Actor, dt: f32) {
     } else {
         boss.vel.y -= dt * 500.0;
     }
+
+    boss.vel.x -= 10.0 * dt * boss.vel.x;
+
+    boss.phase_timer += dt;
+    match boss.phase {
+        BossPhase::Attack if boss.phase_timer > 10.0 => {
+            boss.phase_timer = 0.0;
+            boss.phase = BossPhase::Evade;
+
+        }
+        BossPhase::Evade if boss.phase_timer > 10.0 => {
+            boss.phase_timer = 0.0;
+            boss.phase = BossPhase::Attack;
+        }
+        _ => ()
+    }
+
+    match boss.phase {
+        BossPhase::Attack => {
+            boss_update_attack(boss, player, bullets, dt);
+        }
+        BossPhase::Evade => {
+            boss_update_evade(boss, player, dt);
+        }
+    }
+}
+
+fn boss_update_attack(boss: &mut Boss, player: &mut Actor, bullets: &mut Bullets, dt: f32) {
+    // Unimplemented   
+}
+
+fn boss_update_evade(boss: &mut Boss, player: &mut Actor, dt: f32) {
+    // Unimplemented
+}
+
+fn handle_intersection(boss: &mut Boss, bullets: &mut Bullets, dt: f32) {
+    for bullet in &mut bullets.bullets {
+        if bullet.alive && Disc::new(bullet.pos, 5.0).intersects(&Disc::new(boss.pos, 10.0)) {
+            bullet.alive = false;
+            boss.hp -= 10.0;
+            boss.vel.x += bullet.vel.x / 2.0;
+        }
+    }
+}
+
+struct Disc {
+    pos: Point2,
+    radius: f32
+}
+
+impl Disc {
+    fn new(pos: Point2, radius: f32) -> Self {
+        Disc { pos, radius }
+    }
+
+    fn intersects(&self, other: &Disc) -> bool {
+        let d = self.pos.distance(&other.pos);
+        d < self.radius || d < other.radius
+    }
 }
 
 fn bullets_update_position(bullets: &mut Bullets, dt: f32) {
@@ -555,28 +943,36 @@ fn bullets_update_position(bullets: &mut Bullets, dt: f32) {
     }
 }
 
-impl EventHandler for MainState {
+impl<'a, 'b> EventHandler for MainState<'a, 'b> {
     fn update(&mut self, ctx: &mut Context) -> GameResult<()> {
         const DESIRED_FPS: u32 = 60;
         while timer::check_update_time(ctx, DESIRED_FPS) {
             let seconds = 1.0 / (DESIRED_FPS as f32);
 
-            player_handle_input(&mut self.player, &mut self.bullets, &self.hooks, &self.input, seconds, self.global_time);
-            player_update_position(&mut self.player, seconds, self.global_time);
-            bullets_update_position(&mut self.bullets, seconds);
-            boss_update(&mut self.boss, &mut self.player, seconds);
+            {
+                let mut delta = self.world.write_resource::<DeltaTime>();
+                *delta = DeltaTime(seconds);
+            }
+
+            //player_handle_input(&mut self.player, &mut self.bullets, &self.hooks, &self.input, seconds, self.global_time);
+            //player_update_position(&mut self.player, seconds, self.global_time);
+            //bullets_update_position(&mut self.bullets, seconds);
+            //boss_update(&mut self.boss, &mut self.player, &mut self.bullets, seconds);
+            //handle_intersection(&mut self.boss, &mut self.bullets, seconds);
             self.update_ui(ctx);
             self.update_key_flags();
             self.global_time = get_time(ctx);
+            self.dispatcher.dispatch(&self.world.res);
         }
-        self.input.just_pressed.clear();
+        let mut input_state = self.world.write_resource::<InputState>();
+        input_state.just_pressed.clear();
         Ok(())
     }
 
     fn draw(&mut self, ctx: &mut Context) -> GameResult<()> {
         graphics::clear(ctx);
 
-        {
+        /*{
             let assets = &mut self.assets;
             let p = &self.player;
             draw_actor(assets, ctx, p, self.screen_width, self.screen_height)?;
@@ -585,10 +981,31 @@ impl EventHandler for MainState {
             for hook in &self.hooks {
                 draw_hook(assets, ctx, *hook, self.screen_width, self.screen_height)?;
             }
-        }
+        }*/
 
         let debug_data_pos = graphics::Point2::new(10.0, 10.0);
         graphics::draw(ctx, &self.debug_data, debug_data_pos, 0.0)?;
+
+        use specs::Join;
+
+        let entities = self.world.entities();
+        let positions = self.world.read_storage::<Pos>();
+        let bullets = self.world.read_storage::<BulletStatus>();
+        let hooks = self.world.read_storage::<IsHook>();
+
+        for (ent, pos, bullet) in (&*entities, &positions, &bullets).join() {
+            if let BulletStatus::Alive = bullet {
+                draw_bullet_sprite(&mut self.assets, ctx, *pos, self.screen_width, self.screen_height)?;
+            }
+        }
+
+        for (ent, pos, not_bullet, not_hook) in (&*entities, &positions, !&bullets, !&hooks).join() {
+            draw_debug_sprite(&mut self.assets, ctx, *pos, self.screen_width, self.screen_height)?;
+        }
+
+        for (pos, hook) in (&positions, &hooks).join() {
+            draw_bullet_sprite(&mut self.assets, ctx, *pos, self.screen_width, self.screen_height)?;
+        }
 
         graphics::present(ctx);
 
@@ -622,19 +1039,19 @@ impl EventHandler for MainState {
     fn key_up_event(&mut self, _ctx: &mut Context, keycode: Keycode, _keymod: Mod, _repeat: bool) {
         match keycode {
             Keycode::Left => {
-                self.input.keys.remove(&Input::LEFT);
+                self.unregister_keypress(Input::LEFT);
             }
             Keycode::Right => {
-                self.input.keys.remove(&Input::RIGHT);
+                self.unregister_keypress(Input::RIGHT);
             }
             Keycode::Z => {
-                self.input.keys.remove(&Input::SHOOT);
+                self.unregister_keypress(Input::SHOOT);
             }
             Keycode::X => {
-                self.input.keys.remove(&Input::TOOL);
+                self.unregister_keypress(Input::TOOL);
             }
             Keycode::Up | Keycode::Space => {
-                self.input.keys.remove(&Input::JUMP);
+                self.unregister_keypress(Input::JUMP);
             }
             _ => (), // Do nothing
         }
@@ -664,17 +1081,16 @@ pub fn main() {
         unimplemented!();
     }
 
-    let ctx = &mut cb.build().unwrap();
+    let mut ctx = &mut cb.build().unwrap();
     set_default_filter(ctx, FilterMode::Nearest);
 
-
-    match MainState::new(ctx) {
+    match MainState::new(&mut ctx) {
         Err(e) => {
             println!("Could not load game!");
             println!("Error: {}", e);
         }
         Ok(ref mut game) => {
-            let result = event::run(ctx, game);
+            let result = event::run(&mut ctx, game);
             if let Err(e) = result {
                 println!("Error encountered running game: {}", e);
             } else {

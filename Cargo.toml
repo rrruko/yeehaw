@@ -7,3 +7,5 @@ authors = ["ruko <rukokarasu@gmail.com>"]
 alga = "0.7.1"
 ggez = "0.4.4"
 rand = "0.5.5"
+specs = "0.12.2"
+specs-derive = "0.2.0"
